@@ -936,4 +936,1172 @@ def handle_question_input(user_id, chat_id, text, user_msg_id):
     set_step(user_id, "confirm_question", {"question": question, "preview_msg_id": prev_q_msg["message_id"]})
 
 
-def handle_confirm_question(user_id, chat_id
+def handle_confirm_question(user_id, chat_id, choice):
+    st = get_state(user_id) or {}
+    preview_msg_id = st.get("data", {}).get("preview_msg_id")
+    safe_delete(chat_id, preview_msg_id)
+
+    if choice == "edit":
+        next_msg = api.send_message(chat_id, "📝 Now write your poll question again:", reply_markup=cancel_keyboard())
+        set_step(user_id, "await_question", {"last_bot_msg_id": next_msg["message_id"]})
+        return
+
+    next_msg = api.send_message(
+        chat_id,
+        "📸 Add a photo/banner for your poll\n\n"
+        "If you want to show a picture with the poll, send it now (as a photo).\n\n"
+        "If you don't want to add a photo, tap the \"🟢 Text Only\" button below.",
+        reply_markup=photo_step_keyboard(),
+    )
+    set_step(user_id, "await_photo", {"last_bot_msg_id": next_msg["message_id"]})
+
+
+def handle_photo_input(user_id, chat_id, photo_sizes, user_msg_id):
+    st = get_state(user_id) or {}
+    prev_bot_msg = st.get("data", {}).get("last_bot_msg_id")
+    safe_delete(chat_id, user_msg_id)
+    safe_delete(chat_id, prev_bot_msg)
+
+    file_id = photo_sizes[-1]["file_id"]
+    next_msg = ask_for_options(chat_id)
+    set_step(user_id, "await_options", {"photo_file_id": file_id, "last_bot_msg_id": next_msg["message_id"]})
+
+
+def handle_skip_photo(user_id, chat_id, user_msg_id=None):
+    st = get_state(user_id) or {}
+    prev_bot_msg = st.get("data", {}).get("last_bot_msg_id")
+    safe_delete(chat_id, user_msg_id)
+    safe_delete(chat_id, prev_bot_msg)
+
+    next_msg = ask_for_options(chat_id)
+    set_step(user_id, "await_options", {"photo_file_id": None, "last_bot_msg_id": next_msg["message_id"]})
+
+
+def ask_for_options(chat_id):
+    return api.send_message(
+        chat_id,
+        "🏷️ Now send the poll options/participant names (comma or new line):\n\n"
+        "Example:\nRana, Kamal, Boro\n\n"
+        f"Minimum {MIN_OPTIONS} options and maximum {MAX_OPTIONS} options are allowed.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+def handle_options_input(user_id, chat_id, text, user_msg_id):
+    st = get_state(user_id) or {}
+    prev_bot_msg = st.get("data", {}).get("last_bot_msg_id")
+
+    raw = text.replace("\n", ",")
+    options = [o.strip() for o in raw.split(",") if o.strip()]
+    seen, clean = set(), []
+    for o in options:
+        if o.lower() not in seen:
+            seen.add(o.lower())
+            clean.append(o)
+
+    if len(clean) < MIN_OPTIONS:
+        api.send_message(chat_id, f"❌ Please provide at least {MIN_OPTIONS} options. Try again:", reply_markup=cancel_keyboard())
+        return
+    if len(clean) > MAX_OPTIONS:
+        api.send_message(chat_id, f"❌ Maximum {MAX_OPTIONS} options are allowed. Try again:", reply_markup=cancel_keyboard())
+        return
+
+    safe_delete(chat_id, user_msg_id)
+    safe_delete(chat_id, prev_bot_msg)
+
+    st["data"]["options"] = clean
+
+    # Timer menu
+    t_msg = api.send_message(
+        chat_id,
+        "⏱️ <b>Choose how long this poll should run:</b>\n\n"
+        "The poll will close automatically after the selected time.",
+        reply_markup=build_timer_keyboard()
+    )
+    set_step(user_id, "await_timer_choice", {"timer_msg_id": t_msg["message_id"]})
+
+
+def render_final_preview_text(data):
+    ch_handle = f"@{data.get('channel_username')}" if data.get('channel_username') else str(data.get('channel_id'))
+    has_photo = "Yes" if data.get("photo_file_id") else "No"
+    
+    cand_lines = []
+    for idx, opt in enumerate(data["options"], start=1):
+        cand_lines.append(f"👤 {idx}. {esc(opt)}")
+
+    timer_text = data.get("timer_str", "Unlimited")
+
+    return (
+        "📊 <b>Final Preview of Your Poll:</b>\n\n"
+        f"📢 <b>Channel:</b> {ch_handle}\n"
+        f"❓ <b>Question:</b> {esc(data['question'])}\n"
+        f"⏱️ <b>Duration:</b> {timer_text}\n"
+        f"🖼️ <b>Photo Attached:</b> {has_photo}\n\n"
+        "📝 <b>Participants:</b>\n" +
+        "\n".join(cand_lines) + "\n"
+        "────────────────────────\n"
+        "🛡️ <b>Set the poll's security settings:</b>\n"
+        "Click the buttons below to toggle security on/off."
+    )
+
+# ---------------------------------------------------------------- Manage & Edit Flow
+
+def show_edit_poll_list(chat_id, user_id):
+    polls = list_open_polls_by_creator(user_id)
+    if not polls:
+        api.send_message(chat_id, "📭 You have no active polls.", reply_markup=main_menu_keyboard(user_id))
+        return
+    rows = []
+    for p in polls:
+        label = p["question"][:35] + ("…" if len(p["question"]) > 35 else "")
+        rows.append([inline_button(f"✏️ {label}", callback_data=f"poll_edit_select:{p['id']}", style="primary")])
+    rows.append([inline_button("⬅️ Back to Menu", callback_data="menu:main", style="danger")])
+    api.send_message(chat_id, "🗂️ Select the poll where you want to add new names/options:", reply_markup=inline_keyboard(rows))
+
+
+def handle_add_options_input(user_id, chat_id, text, user_msg_id):
+    st = get_state(user_id)
+    poll_id = st["data"]["poll_id"]
+    poll = get_poll(poll_id)
+    if not poll or poll["status"] != "open":
+        api.send_message(chat_id, "❌ This poll is no longer active.", reply_markup=main_menu_keyboard(user_id))
+        reset_state(user_id)
+        return
+
+    if poll["creator_id"] != user_id:
+        api.send_message(chat_id, "⛔ Only the poll creator can add names.", reply_markup=main_menu_keyboard(user_id))
+        reset_state(user_id)
+        return
+
+    raw = text.replace("\n", ",")
+    new_opts = [o.strip() for o in raw.split(",") if o.strip()]
+    if not new_opts:
+        api.send_message(chat_id, "❌ Please send valid names:", reply_markup=cancel_keyboard())
+        return
+
+    safe_delete(chat_id, user_msg_id)
+
+    existing_opts = json.loads(poll["options"])
+    existing_emojis = json.loads(poll["emojis"])
+    seen_lower = {o.lower() for o in existing_opts}
+
+    added = []
+    for o in new_opts:
+        if o.lower() not in seen_lower:
+            seen_lower.add(o.lower())
+            existing_opts.append(o)
+            added.append(o)
+            existing_emojis.append(random.choice(EMOJI_POOL))
+
+    if not added:
+        api.send_message(chat_id, "⚠️ These names are already added to the poll!", reply_markup=main_menu_keyboard(user_id))
+        reset_state(user_id)
+        return
+
+    update_poll_options(poll_id, existing_opts, existing_emojis)
+    updated_poll = get_poll(poll_id)
+    push_open_update(updated_poll)
+    reset_state(user_id)
+
+    api.send_message(
+        chat_id,
+        f"✅ Successfully added {len(added)} new name(s) to the poll and updated the channel!\n\n"
+        f"➕ Added names: {', '.join(added)}",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+# ---------------------------------------------------------------- Admin Panel Features
+
+def admin_show_all_polls_boost(chat_id):
+    polls = list_all_open_polls()
+    if not polls:
+        api.send_message(chat_id, "📭 There are no active polls right now.", reply_markup=admin_panel_inline_keyboard())
+        return
+    rows = []
+    for p in polls:
+        ch_name = p.get('channel_title') or p.get('channel_username') or str(p['channel_id'])
+        label = f"📊 {p['question'][:25]}… ({ch_name})"
+        rows.append([inline_button(label, callback_data=f"admin_poll:{p['id']}", style="primary")])
+    rows.append([inline_button("⬅️ Go Back", callback_data="menu:admin", style="danger")])
+    api.send_message(chat_id, f"🗳️ All active polls ({len(polls)}):\nSelect a poll to manage votes:", reply_markup=inline_keyboard(rows))
+
+
+def admin_show_poll_options(chat_id, poll_id):
+    poll = get_poll(poll_id)
+    if not poll or poll["status"] != "open":
+        api.send_message(chat_id, "❌ This poll is now closed or not found.")
+        return
+
+    options = json.loads(poll["options"])
+    emojis = json.loads(poll["emojis"])
+    counts = vote_counts(poll_id, len(options))
+
+    ch_handle = f"@{poll.get('channel_username')}" if poll.get('channel_username') else str(poll.get('channel_id'))
+    ch_title = poll.get('channel_title') or ""
+    ch_info = f"{esc(ch_title)} ({ch_handle})" if ch_title else ch_handle
+
+    rows = []
+    for i, opt in enumerate(options):
+        btn_text = f"{emojis[i]} {opt} (Votes: {counts[i]})"
+        rows.append([inline_button(btn_text, callback_data=f"admin_opt_menu:{poll_id}:{i}", style="primary")])
+    rows.append([inline_button("⬅️ Back", callback_data="admin:allpolls", style="danger")])
+
+    api.send_message(
+        chat_id,
+        f"📢 <b>Channel:</b> {ch_info}\n"
+        f"📋 <b>Poll Question:</b> {esc(poll['question'])}\n\n"
+        "👉 Click on the option/participant whose votes you want to control:",
+        reply_markup=inline_keyboard(rows),
+    )
+
+
+def admin_show_option_action_menu(chat_id, poll_id, opt_idx):
+    poll = get_poll(poll_id)
+    if not poll or poll["status"] != "open":
+        api.send_message(chat_id, "❌ This poll is no longer active.")
+        return
+
+    options = json.loads(poll["options"])
+    emojis = json.loads(poll["emojis"])
+    counts = vote_counts(poll_id, len(options))
+
+    ch_handle = f"@{poll.get('channel_username')}" if poll.get('channel_username') else str(poll.get('channel_id'))
+    ch_title = poll.get('channel_title') or ""
+    ch_info = f"{esc(ch_title)} ({ch_handle})" if ch_title else ch_handle
+
+    opt_name = options[opt_idx]
+    emoji = emojis[opt_idx]
+
+    rows = [
+        [inline_button("➕ Add Votes (Boost)", callback_data=f"admin_boost:{poll_id}:{opt_idx}", style="success")],
+        [inline_button("➖ Reduce Votes", callback_data=f"admin_reduce:{poll_id}:{opt_idx}", style="danger")],
+        [inline_button("⬅️ Back", callback_data=f"admin_poll:{poll_id}", style="primary")],
+    ]
+
+    api.send_message(
+        chat_id,
+        f"📢 <b>Channel:</b> {ch_info}\n"
+        f"👤 <b>Participant:</b> {emoji} {esc(opt_name)}\n"
+        f"📊 <b>Current Votes:</b> {counts[opt_idx]}\n\n"
+        "Choose an option below:",
+        reply_markup=inline_keyboard(rows),
+    )
+
+
+def admin_handle_boost(user_id, chat_id, text):
+    st = get_state(user_id)
+    poll_id = st["data"]["poll_id"]
+    opt_idx = st["data"]["opt_idx"]
+
+    try:
+        count = int(text.strip())
+        if count <= 0:
+            raise ValueError()
+    except Exception:
+        api.send_message(chat_id, "❌ Please enter a valid positive number (e.g. 50):", reply_markup=cancel_keyboard())
+        return
+
+    add_boosted_votes(poll_id, opt_idx, count)
+    poll = get_poll(poll_id)
+    push_open_update(poll)
+
+    options = json.loads(poll["options"])
+    reset_state(user_id)
+
+    api.send_message(
+        chat_id,
+        f"✅ <b>Votes successfully added!</b>\n\n"
+        f"👤 Participant: <b>{esc(options[opt_idx])}</b>\n"
+        f"➕ Votes Added: <b>{count}</b>\n\n"
+        f"The channel has been updated live!",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+
+def admin_handle_reduce(user_id, chat_id, text):
+    st = get_state(user_id)
+    poll_id = st["data"]["poll_id"]
+    opt_idx = st["data"]["opt_idx"]
+    max_c = st["data"]["current_votes"]
+
+    try:
+        amount = int(text.strip())
+        if amount <= 0 or amount > max_c:
+            raise ValueError()
+    except Exception:
+        api.send_message(chat_id, f"❌ Please enter a valid number between 1 and {max_c}:", reply_markup=cancel_keyboard())
+        return
+
+    reduced = reduce_votes_count(poll_id, opt_idx, amount)
+    poll = get_poll(poll_id)
+    push_open_update(poll)
+
+    options = json.loads(poll["options"])
+    reset_state(user_id)
+
+    api.send_message(
+        chat_id,
+        f"✅ <b>Votes successfully reduced!</b>\n\n"
+        f"👤 Participant: <b>{esc(options[opt_idx])}</b>\n"
+        f"📉 Reduced By: <b>{reduced}</b>\n\n"
+        f"The channel has been updated live!",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+
+def admin_show_stats(chat_id):
+    s = stats_counts()
+    text = (
+        "📊 <b>Bot Statistics</b>\n\n"
+        f"🗳️ Total Polls: {s['total_polls']}\n"
+        f"🟢 Active Polls: {s['open_polls']}\n"
+        f"🔴 Closed Polls: {s['closed_polls']}\n"
+        f"✅ Total Votes: {s['total_votes']}\n"
+        f"👥 Total Users: {s['total_users']}\n"
+        f"📣 Total Channels: {s['total_channels']}"
+    )
+    api.send_message(chat_id, text, reply_markup=admin_panel_inline_keyboard())
+
+
+def admin_show_connected_channels(chat_id):
+    channels = list_distinct_channels()
+    if not channels:
+        api.send_message(chat_id, "📭 No channels have been connected yet.", reply_markup=admin_panel_inline_keyboard())
+        return
+    text = f"📡 <b>Connected Channels ({len(channels)}):</b>\n\n"
+    for i, ch in enumerate(channels, start=1):
+        username = f"@{ch['channel_username']}" if ch['channel_username'] else "No Username"
+        text += f"{i}. <b>{esc(ch['channel_title'] or 'Unknown')}</b>\n   🔗 {username} | ID: <code>{ch['channel_id']}</code>\n   🗳 Total Polls: {ch['poll_count']}\n\n"
+    api.send_message(chat_id, text, reply_markup=inline_keyboard([[inline_button("⬅️ Back", callback_data="menu:admin", style="danger")]]))
+
+
+def admin_show_force_sub_menu(chat_id):
+    current = get_setting("force_channel", "Not set")
+    text = (
+        f"🔐 <b>Force Subscribe (Force Join) Settings</b>\n\n"
+        f"📌 Current Channel(s): <b>{esc(current)}</b>\n\n"
+        "<i>(To add multiple channels, separate them with commas, e.g. @ch1, @ch2)</i>"
+    )
+    kb = inline_keyboard([
+        [inline_button("➕ Set/Change Channel", callback_data="force:set", style="success")],
+        [inline_button("🗑️ Remove", callback_data="force:remove", style="danger")],
+        [inline_button("⬅️ Back", callback_data="menu:admin", style="primary")]
+    ])
+    api.send_message(chat_id, text, reply_markup=kb)
+
+
+def admin_show_btn_settings_menu(chat_id):
+    kb = inline_keyboard([
+        [inline_button("🛒 Buy Code Button Settings", callback_data="btnset:code", style="primary")],
+        [inline_button("📞 Support Button Settings", callback_data="btnset:sup", style="primary")],
+        [inline_button("⬅️ Back", callback_data="menu:admin", style="danger")]
+    ])
+    api.send_message(chat_id, "⚙️ <b>Code & Support Button Settings</b>\n\nSelect which button you want to customize:", reply_markup=kb)
+
+# ---------------------------------------------------------------- Actions
+
+def do_vote(cq, poll_id, option_index):
+    user = cq["from"]
+    
+    # Anti-flood check
+    if is_flooding(user["id"]):
+        api.answer_callback_query(cq["id"], "⚠️ You are clicking too fast! Please try again in a moment.", show_alert=True)
+        return
+
+    poll = get_poll(poll_id)
+    if not poll:
+        api.answer_callback_query(cq["id"], "❌ This poll no longer exists.", show_alert=True)
+        return
+    if poll["status"] != "open":
+        api.answer_callback_query(cq["id"], "🔒 This poll has been closed.", show_alert=True)
+        return
+
+    # Membership check
+    if not is_user_channel_member(poll["channel_id"], user["id"]):
+        api.answer_callback_query(
+            cq["id"],
+            "⚠️ To vote, you must first join this channel!",
+            show_alert=True
+        )
+        return
+
+    # Username check
+    if poll.get("username_check", 0) == 1 and not user.get("username"):
+        api.answer_callback_query(
+            cq["id"],
+            "⚠️ Security Alert: Your Telegram account has no username set! Please set a username to vote.",
+            show_alert=True
+        )
+        return
+
+    # Photo check
+    if poll.get("photo_check", 0) == 1:
+        photos = api.get_user_profile_photos(user["id"], limit=1)
+        if photos.get("total_count", 0) == 0:
+            api.answer_callback_query(
+                cq["id"],
+                "⚠️ Security Alert: You must have a profile picture to vote!",
+                show_alert=True
+            )
+            return
+
+    # New ID filter
+    if poll.get("fake_filter", 0) == 1:
+        if is_account_newer_than_configured_days(user["id"]):
+            api.answer_callback_query(
+                cq["id"],
+                "⚠️ Your account is new/fake 🚫 so your vote cannot be accepted. ❌",
+                show_alert=True
+            )
+            return
+
+    name = user.get("username") or user.get("first_name") or str(user["id"])
+    ok = cast_vote(poll_id, user["id"], name, option_index)
+    if not ok:
+        api.answer_callback_query(cq["id"], "⚠️ You have already voted.", show_alert=True)
+        return
+
+    push_open_update(poll)
+
+    # Custom success alert
+    options = json.loads(poll["options"])
+    emojis = json.loads(poll["emojis"])
+    counts = vote_counts(poll_id, len(options))
+    opt_name = f"{emojis[option_index]} {options[option_index]}"
+    opt_count = counts[option_index]
+
+    sorted_counts = sorted(counts, reverse=True)
+    rank = sorted_counts.index(opt_count) + 1
+    rank_str = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'} place"
+
+    alert_text = (
+        "🎉 Vote Successful!\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Your Choice: {opt_name}\n"
+        f"📈 Current Votes for this Participant: {opt_count}\n"
+        f"🏆 Current Position: {rank_str}\n\n"
+        "⚠️ Remember: If you leave the channel, your vote will be cancelled!"
+    )
+    api.answer_callback_query(cq["id"], alert_text, show_alert=True)
+
+    # Vote notification (to admins)
+    if get_setting("vote_notification", "0") == "1":
+        name_parts = [user.get("first_name", ""), user.get("last_name") or ""]
+        fullname = " ".join([p for p in name_parts if p]).strip() or user.get("username") or str(user["id"])
+        username_text = f"@{user['username']}" if user.get("username") else "None"
+
+        notif_text = (
+            "🗳 <b>The poll is being tracked automatically.</b>\n\n"
+            "👷 <b>A new vote has been cast:</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            f"👤 Name : {esc(fullname)}\n"
+            f"🔰 Username : {esc(username_text)}\n"
+            f"🆔 User ID : <code>{user['id']}</code>\n"
+            f"📌 Voted For : {esc(opt_name)} (Votes: {opt_count})\n"
+            "━━━━━━━━━━━━━━"
+        )
+        for owner_id in OWNER_IDS:
+            try:
+                api.send_message(owner_id, notif_text)
+            except Exception:
+                pass
+
+
+def do_retract(cq, poll_id):
+    user = cq["from"]
+    poll = get_poll(poll_id)
+    if not poll:
+        api.answer_callback_query(cq["id"], "❌ This poll no longer exists.", show_alert=True)
+        return
+    if poll["status"] != "open":
+        api.answer_callback_query(cq["id"], "🔒 This poll has been closed.", show_alert=True)
+        return
+    removed = retract_vote(poll_id, user["id"])
+    if not removed:
+        api.answer_callback_query(cq["id"], "⚠️ You haven't voted yet.", show_alert=True)
+        return
+    push_open_update(poll)
+    api.answer_callback_query(cq["id"], "🔄 Your vote has been retracted.")
+
+
+def do_close(cq, poll_id):
+    user = cq["from"]
+    poll = get_poll(poll_id)
+    if not poll:
+        api.answer_callback_query(cq["id"], "❌ This poll no longer exists.", show_alert=True)
+        return
+    if poll["status"] != "open":
+        api.answer_callback_query(cq["id"], "🔒 The poll is already closed.", show_alert=True)
+        return
+    if not user_can_manage_poll(poll, user["id"]):
+        api.answer_callback_query(cq["id"], "⛔ You do not have permission to close this poll.", show_alert=True)
+        return
+
+    options = json.loads(poll["options"])
+    counts = vote_counts(poll_id, len(options))
+    winner_index = counts.index(max(counts)) if sum(counts) > 0 else 0
+
+    close_poll_db(poll_id, winner_index)
+    poll = get_poll(poll_id)
+    api.answer_callback_query(cq["id"], "🔴 Closing the poll…")
+    push_closed_update(poll)
+
+# ---------------------------------------------------------------- Handle Leave / Chat Member (Vote cancellation & admin notification)
+
+def handle_chat_member(upd):
+    """If a user leaves or is banned from the channel, their vote is cancelled and admins are notified"""
+    chat = upd.get("chat")
+    if not chat:
+        return
+    channel_id = chat.get("id")
+    new_member = upd.get("new_chat_member")
+    if not new_member:
+        return
+    user = new_member.get("user")
+    if not user:
+        return
+    user_id = user.get("id")
+    status = new_member.get("status")
+
+    if not channel_id or not user_id:
+        return
+
+    if status in ("left", "kicked", "banned"):
+        with _lock:
+            rows = conn.execute(
+                "SELECT * FROM polls WHERE channel_id = ? AND status = 'open'",
+                (channel_id,)
+            ).fetchall()
+            open_polls = [dict(r) for r in rows]
+
+        for p in open_polls:
+            pid = p["id"]
+            vote_row = None
+            with _lock:
+                vote_row = conn.execute(
+                    "SELECT option_index FROM votes WHERE poll_id = ? AND user_id = ?",
+                    (pid, user_id)
+                ).fetchone()
+
+                deleted = False
+                if vote_row:
+                    conn.execute("DELETE FROM votes WHERE poll_id = ? AND user_id = ?", (pid, user_id))
+                    conn.commit()
+                    deleted = True
+
+            # If vote was removed, live-update the channel post
+            if deleted:
+                poll = get_poll(pid)
+                if poll and poll.get("message_id"):
+                    try:
+                        push_open_update(poll)
+                    except Exception:
+                        pass
+
+                # Notify admins
+                if get_setting("vote_notification", "0") == "1":
+                    try:
+                        opt_idx = vote_row["option_index"]
+                        opts = json.loads(p["options"])
+                        ems = json.loads(p["emojis"])
+                        opt_name = f"{ems[opt_idx]} {opts[opt_idx]}" if opt_idx < len(opts) else f"Option {opt_idx+1}"
+
+                        name_parts = [user.get("first_name", ""), user.get("last_name") or ""]
+                        fullname = " ".join([pt for pt in name_parts if pt]).strip() or user.get("username") or str(user_id)
+                        username_text = f"@{user['username']}" if user.get("username") else "None"
+                        ch_name = p.get("channel_title") or chat.get("title") or str(channel_id)
+
+                        leave_notif = (
+                            "⚠️ <b>Warning: A user has left the channel!</b>\n\n"
+                            "❌ <b>Vote automatically cancelled:</b>\n"
+                            "━━━━━━━━━━━━━━\n"
+                            f"👤 Name : {esc(fullname)}\n"
+                            f"🔰 Username : {esc(username_text)}\n"
+                            f"🆔 User ID : <code>{user_id}</code>\n"
+                            f"📢 Channel : {esc(ch_name)}\n"
+                            f"📌 Cancelled Vote : {esc(opt_name)}\n"
+                            "━━━━━━━━━━━━━━"
+                        )
+                        for owner_id in OWNER_IDS:
+                            try:
+                                api.send_message(owner_id, leave_notif)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+# ---------------------------------------------------------------- Auto Timer Background Loop
+
+def auto_poll_closer_loop():
+    """Auto-timer monitor thread"""
+    while True:
+        try:
+            now = int(time.time())
+            with _lock:
+                rows = conn.execute(
+                    "SELECT id FROM polls WHERE status = 'open' AND end_time > 0 AND end_time <= ?",
+                    (now,)
+                ).fetchall()
+                expired_ids = [r["id"] for r in rows]
+
+            for pid in expired_ids:
+                poll = get_poll(pid)
+                if poll and poll["status"] == "open":
+                    options = json.loads(poll["options"])
+                    counts = vote_counts(pid, len(options))
+                    winner_index = counts.index(max(counts)) if sum(counts) > 0 else 0
+                    close_poll_db(pid, winner_index)
+                    poll = get_poll(pid)
+                    push_closed_update(poll)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(15)
+
+# ---------------------------------------------------------------- Dispatch
+
+def handle_message(msg):
+    if "from" not in msg or msg["from"].get("is_bot"):
+        return
+    user = msg["from"]
+    user_id = user["id"]
+    chat_id = msg["chat"]["id"]
+    msg_id = msg.get("message_id")
+    text = msg.get("text", "") or ""
+
+    if text == "/start":
+        handle_start(msg)
+        return
+    if text in ("/cancel", "❌ Cancel"):
+        handle_cancel(user_id, chat_id)
+        return
+
+    if not check_force_sub(user_id):
+        send_force_sub_message(chat_id)
+        return
+
+    if text == "📣 Create Channel Poll":
+        start_create_flow(user_id, chat_id)
+        return
+    elif text == "✏️ Edit Poll":
+        reset_state(user_id)
+        show_edit_poll_list(chat_id, user_id)
+        return
+    elif text == "🛒 Buy Code":
+        buy_msg = get_setting("code_buy_text", "🛒 To buy the source code, contact via the button below:")
+        buy_btn = get_setting("code_buy_btn_name", "📩 Contact Us")
+        buy_url = get_setting("code_buy_url", "https://t.me/your_admin")
+        if not buy_url.startswith("http"):
+            buy_url = f"https://t.me/{buy_url.lstrip('@')}"
+        kb = inline_keyboard([[inline_button(buy_btn, url=buy_url, style="success")]])
+        api.send_message(chat_id, esc(buy_msg), reply_markup=kb)
+        return
+    elif text == "📞 Support":
+        sup_msg = get_setting("support_text", "📞 For any help, contact via the button below:")
+        sup_btn = get_setting("support_btn_name", "📩 Contact Us")
+        sup_url = get_setting("support_url", "https://t.me/your_admin")
+        if not sup_url.startswith("http"):
+            sup_url = f"https://t.me/{sup_url.lstrip('@')}"
+        kb = inline_keyboard([[inline_button(sup_btn, url=sup_url, style="primary")]])
+        api.send_message(chat_id, esc(sup_msg), reply_markup=kb)
+        return
+    elif text == "🛠️ Admin Panel":
+        if is_owner(user_id):
+            reset_state(user_id)
+            send_admin_panel(chat_id)
+        return
+
+    st = get_state(user_id)
+    step = st["step"] if st else None
+
+    if step == "await_photo" and text == "🟢 Text Only":
+        handle_skip_photo(user_id, chat_id, msg_id)
+        return
+
+    if step == "admin_await_fake_days" and is_owner(user_id) and text:
+        try:
+            d_val = float(text.strip())
+            if d_val <= 0:
+                raise ValueError()
+            days_str = str(int(d_val)) if d_val.is_integer() else str(d_val)
+            set_setting("fake_id_days", days_str)
+            reset_state(user_id)
+            api.send_message(chat_id, f"✅ New/fake ID filter age threshold successfully set to <b>{days_str} days</b>!", reply_markup=admin_panel_inline_keyboard())
+        except Exception:
+            api.send_message(chat_id, "❌ Please enter a valid positive number (e.g. 7 or 15):", reply_markup=cancel_keyboard())
+        return
+
+    if step == "admin_await_force_channel" and is_owner(user_id) and text:
+        ch = text.strip()
+        set_setting("force_channel", ch)
+        reset_state(user_id)
+        api.send_message(chat_id, f"✅ Force subscribe channel successfully updated: <b>{esc(ch)}</b>", reply_markup=admin_panel_inline_keyboard())
+        return
+
+    if step == "admin_code_step1" and is_owner(user_id) and text:
+        set_step(user_id, "admin_code_step2", {"code_text": text.strip()})
+        api.send_message(chat_id, "🛒 <b>Buy Code Settings (Step 2/3):</b>\n\nNow enter the button name:\n<i>(e.g. 📩 Contact Us)</i>", reply_markup=cancel_keyboard())
+        return
+    if step == "admin_code_step2" and is_owner(user_id) and text:
+        st["data"]["code_btn_name"] = text.strip()
+        set_step(user_id, "admin_code_step3", st["data"])
+        api.send_message(chat_id, "🛒 <b>Buy Code Settings (Step 3/3):</b>\n\nSend the username or link:\n<i>(e.g. @your_username)</i>", reply_markup=cancel_keyboard())
+        return
+    if step == "admin_code_step3" and is_owner(user_id) and text:
+        d = st["data"]
+        set_setting("code_buy_text", d["code_text"])
+        set_setting("code_buy_btn_name", d["code_btn_name"])
+        set_setting("code_buy_url", text.strip())
+        reset_state(user_id)
+        api.send_message(chat_id, "✅ <b>Buy Code button settings completed successfully!</b>", reply_markup=admin_panel_inline_keyboard())
+        return
+
+    if step == "admin_sup_step1" and is_owner(user_id) and text:
+        set_step(user_id, "admin_sup_step2", {"sup_text": text.strip()})
+        api.send_message(chat_id, "📞 <b>Support Settings (Step 2/3):</b>\n\nNow enter the button name:\n<i>(e.g. 📩 Support Inbox)</i>", reply_markup=cancel_keyboard())
+        return
+    if step == "admin_sup_step2" and is_owner(user_id) and text:
+        st["data"]["sup_btn_name"] = text.strip()
+        set_step(user_id, "admin_sup_step3", st["data"])
+        api.send_message(chat_id, "📞 <b>Support Settings (Step 3/3):</b>\n\nSend the support link or username:\n<i>(e.g. @your_support)</i>", reply_markup=cancel_keyboard())
+        return
+    if step == "admin_sup_step3" and is_owner(user_id) and text:
+        d = st["data"]
+        set_setting("support_text", d["sup_text"])
+        set_setting("support_btn_name", d["sup_btn_name"])
+        set_setting("support_url", text.strip())
+        reset_state(user_id)
+        api.send_message(chat_id, "✅ <b>Support button settings completed successfully!</b>", reply_markup=admin_panel_inline_keyboard())
+        return
+
+        if step == "admin_await_custom_ch_id" and is_owner(user_id) and text:
+        ch = text.strip()
+        set_step(user_id, "admin_await_custom_ch_msg", {"target_channel": ch})
+        api.send_message(chat_id, f"📣 Write the message to send to <b>{esc(ch)}</b>:", reply_markup=cancel_keyboard())
+        return
+    if step == "admin_await_custom_ch_msg" and is_owner(user_id) and text:
+        target = st["data"]["target_channel"]
+        reset_state(user_id)
+        try:
+            api.send_message(target, text)
+            api.send_message(chat_id, f"✅ Message sent to <b>{esc(target)}</b>!", reply_markup=admin_panel_inline_keyboard())
+        except Exception as e:
+            api.send_message(chat_id, f"❌ Failed to send message: {e}", reply_markup=admin_panel_inline_keyboard())
+        return
+
+    if step == "admin_await_broadcast_users" and is_owner(user_id) and text:
+        reset_state(user_id)
+        user_ids = list_all_users()
+        ok = fail = 0
+        for uid in user_ids:
+            try:
+                api.send_message(uid, text)
+                ok += 1
+            except Exception:
+                fail += 1
+            time.sleep(0.05)
+        api.send_message(chat_id, f"✅ User broadcast complete!\n\n✅ Success: {ok}\n❌ Failed: {fail}", reply_markup=admin_panel_inline_keyboard())
+        return
+
+    if step == "admin_await_broadcast_channels" and is_owner(user_id) and text:
+        reset_state(user_id)
+        channels = list_distinct_channels()
+        ok = fail = 0
+        for ch in channels:
+            try:
+                api.send_message(ch["channel_id"], text)
+                ok += 1
+            except Exception:
+                fail += 1
+            time.sleep(0.05)
+        api.send_message(chat_id, f"✅ Channel broadcast complete!\n\n✅ Success: {ok}\n❌ Failed: {fail}", reply_markup=admin_panel_inline_keyboard())
+        return
+
+    if step == "admin_boost_step" and is_owner(user_id) and text:
+        admin_handle_boost(user_id, chat_id, text)
+        return
+    if step == "admin_reduce_step" and is_owner(user_id) and text:
+        admin_handle_reduce(user_id, chat_id, text)
+        return
+
+    if step == "await_add_options" and text:
+        handle_add_options_input(user_id, chat_id, text, msg_id)
+        return
+    if step == "await_channel" and text:
+        handle_channel_input(user_id, chat_id, text, msg_id)
+        return
+    if step == "await_question" and text:
+        handle_question_input(user_id, chat_id, text, msg_id)
+        return
+    if step == "await_photo" and msg.get("photo"):
+        handle_photo_input(user_id, chat_id, msg["photo"], msg_id)
+        return
+    if step == "await_options" and text:
+        handle_options_input(user_id, chat_id, text, msg_id)
+        return
+
+    send_main_menu(chat_id, user_id)
+
+
+def handle_callback(cq):
+    data = cq.get("data", "")
+    user_id = cq["from"]["id"]
+    chat_id = cq["message"]["chat"]["id"]
+    msg_id = cq["message"]["message_id"]
+
+    try:
+        if data == "start_poll_creation":
+            api.answer_callback_query(cq["id"])
+            safe_delete(chat_id, msg_id)
+            ask_channel_link(user_id, chat_id)
+            return
+
+        if data.startswith("timer_set:"):
+            choice = data.split(":")[1]
+            if choice == "cancel":
+                api.answer_callback_query(cq["id"])
+                safe_delete(chat_id, msg_id)
+                handle_cancel(user_id, chat_id)
+                return
+
+            timer_map = {
+                "1h": (3600, "1 Hour"),
+                "6h": (21600, "6 Hours"),
+                "12h": (43200, "12 Hours"),
+                "1d": (86400, "1 Day"),
+                "3d": (259200, "3 Days"),
+                "7d": (604800, "7 Days"),
+                "none": (0, "Unlimited (No Timer)")
+            }
+
+            sec, label = timer_map.get(choice, (0, "Unlimited"))
+            end_time = int(time.time()) + sec if sec > 0 else 0
+
+            st = get_state(user_id)
+            if not st:
+                api.answer_callback_query(cq["id"], "❌ Session expired. Please start again.", show_alert=True)
+                return
+
+            st["data"]["end_time"] = end_time
+            st["data"]["timer_str"] = label
+            st["data"]["photo_check"] = 1
+            st["data"]["username_check"] = 1
+            st["data"]["fake_filter"] = 1
+
+            api.answer_callback_query(cq["id"])
+            safe_delete(chat_id, msg_id)
+
+            preview_text = render_final_preview_text(st["data"])
+            kb = build_preview_markup(1, 1, 1)
+
+            sent_prev = api.send_message(chat_id, preview_text, reply_markup=kb)
+            set_step(user_id, "await_preview_action", {"preview_msg_id": sent_prev["message_id"]})
+            return
+
+        if data.startswith("preview_toggle:"):
+            toggle_type = data.split(":")[1]
+            st = get_state(user_id)
+            if not st or "data" not in st:
+                api.answer_callback_query(cq["id"], "❌ Session expired. Please start again.", show_alert=True)
+                return
+
+            d = st["data"]
+            if toggle_type == "photo":
+                d["photo_check"] = 1 if d.get("photo_check", 1) == 0 else 0
+            elif toggle_type == "username":
+                d["username_check"] = 1 if d.get("username_check", 1) == 0 else 0
+            elif toggle_type == "fake":
+                d["fake_filter"] = 1 if d.get("fake_filter", 1) == 0 else 0
+
+            kb = build_preview_markup(d["photo_check"], d["username_check"], d["fake_filter"])
+            api.answer_callback_query(cq["id"])
+            api.edit_message_text(chat_id, msg_id, render_final_preview_text(d), reply_markup=kb)
+            return
+
+        if data == "preview_action:cancel":
+            api.answer_callback_query(cq["id"])
+            safe_delete(chat_id, msg_id)
+            handle_cancel(user_id, chat_id)
+            return
+
+        if data == "preview_action:send":
+            st = get_state(user_id)
+            if not st or "data" not in st:
+                api.answer_callback_query(cq["id"], "❌ Session expired. Please start again.", show_alert=True)
+                return
+            
+            d = st["data"]
+            poll_id = create_poll(
+                creator_id=user_id,
+                channel_id=d["channel_id"],
+                channel_title=d.get("channel_title"),
+                channel_username=d.get("channel_username"),
+                question=d["question"],
+                photo_file_id=d.get("photo_file_id"),
+                options=d["options"],
+                photo_check=d.get("photo_check", 1),
+                username_check=d.get("username_check", 1),
+                fake_filter=d.get("fake_filter", 1),
+                end_time=d.get("end_time", 0)
+            )
+            poll = get_poll(poll_id)
+            counts = [0] * len(d["options"])
+            text_out = render_open_text(poll, 0)
+            kb = render_open_keyboard(poll, counts)
+
+            try:
+                if poll["photo_file_id"]:
+                    sent = api.send_photo(poll["channel_id"], poll["photo_file_id"], text_out, reply_markup=kb)
+                else:
+                    sent = api.send_message(poll["channel_id"], text_out, reply_markup=kb)
+                set_poll_message_id(poll_id, sent["message_id"])
+            except Exception as e:
+                api.answer_callback_query(cq["id"], f"❌ Failed to post in channel: {e}", show_alert=True)
+                return
+
+            api.answer_callback_query(cq["id"], "🚀 Successfully posted in channel!")
+            safe_delete(chat_id, msg_id)
+            reset_state(user_id)
+            api.send_message(chat_id, "✅ Poll successfully posted in the channel!", reply_markup=main_menu_keyboard(user_id))
+            return
+
+        if data == "verify_force_sub":
+            if check_force_sub(user_id):
+                api.answer_callback_query(cq["id"], "✅ Thank you! You have joined the channel.")
+                safe_delete(chat_id, msg_id)
+                send_main_menu(chat_id, user_id)
+            else:
+                api.answer_callback_query(cq["id"], "⚠️ You haven't joined all channels yet!", show_alert=True)
+            return
+
+        if data.startswith("confirm_q:"):
+            choice = data.split(":")[1]
+            api.answer_callback_query(cq["id"])
+            if choice == "yes":
+                handle_confirm_question(user_id, chat_id, "yes")
+            elif choice == "edit":
+                handle_confirm_question(user_id, chat_id, "edit")
+            elif choice == "cancel":
+                handle_cancel(user_id, chat_id)
+            return
+
+        if data == "menu:admin":
+            if not is_owner(user_id):
+                api.answer_callback_query(cq["id"], "⛔ Permission denied.", show_alert=True)
+                return
+            reset_state(user_id)
+            api.answer_callback_query(cq["id"])
+            send_admin_panel(chat_id)
+            return
+        elif data == "admin:toggle_notify":
+            if not is_owner(user_id):
+                return
+            curr = get_setting("vote_notification", "0")
+            new_val = "1" if curr == "0" else "0"
+            set_setting("vote_notification", new_val)
+            status_text = "🟢 ON" if new_val == "1" else "🔴 OFF"
+            api.answer_callback_query(cq["id"], f"Vote notification turned {status_text}!")
+            api.edit_message_reply_markup(chat_id, msg_id, reply_markup=admin_panel_inline_keyboard())
+            return
+        elif data == "admin:set_fake_days":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_await_fake_days")
+            api.answer_callback_query(cq["id"])
+            curr_days = get_setting("fake_id_days", "7")
+            api.send_message(
+                chat_id,
+                f"⏳ <b>Set Fake ID Age Threshold:</b>\n\n"
+                f"📌 Current setting: <b>{curr_days} days</b>\n\n"
+                "Enter a number for how many days new accounts should be considered fake/ineligible (e.g. 7 or 10):",
+                reply_markup=cancel_keyboard()
+            )
+            return
+        elif data == "admin:stats":
+            if not is_owner(user_id):
+                return
+            api.answer_callback_query(cq["id"])
+            admin_show_stats(chat_id)
+            return
+        elif data == "admin:connected_ch":
+            if not is_owner(user_id):
+                return
+            api.answer_callback_query(cq["id"])
+            admin_show_connected_channels(chat_id)
+            return
+        elif data == "admin:force_sub":
+            if not is_owner(user_id):
+                return
+            api.answer_callback_query(cq["id"])
+            admin_show_force_sub_menu(chat_id)
+            return
+        elif data == "force:set":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_await_force_channel")
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "📣 Enter the channel username for force subscribe (multiple channels can be separated by commas):", reply_markup=cancel_keyboard())
+            return
+        elif data == "force:remove":
+            if not is_owner(user_id):
+                return
+            set_setting("force_channel", "")
+            api.answer_callback_query(cq["id"], "✅ Force subscribe removed!")
+            admin_show_force_sub_menu(chat_id)
+            return
+        elif data == "admin:btn_settings":
+            if not is_owner(user_id):
+                return
+            api.answer_callback_query(cq["id"])
+            admin_show_btn_settings_menu(chat_id)
+            return
+        elif data == "btnset:code":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_code_step1", {})
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "🛒 <b>Buy Code Settings (Step 1/3):</b>\n\nWrite the detailed message you want to show:", reply_markup=cancel_keyboard())
+            return
+        elif data == "btnset:sup":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_sup_step1", {})
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "📞 <b>Support Settings (Step 1/3):</b>\n\nWrite the detailed message you want to show:", reply_markup=cancel_keyboard())
+            return
+        elif data == "admin_bc:custom":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_await_custom_ch_id")
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "🎯 Send the channel username or ID:", reply_markup=cancel_keyboard())
+            return
+        elif data == "admin_bc:users":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_await_broadcast_users")
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "📣 Write the message to send to all users:", reply_markup=cancel_keyboard())
+            return
+        elif data == "admin_bc:channels":
+            if not is_owner(user_id):
+                return
+            set_step(user_id, "admin_await_broadcast_channels")
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "📣 Write the message to send to all channels:", reply_markup=cancel_keyboard())
+            return
+        elif data == "admin:allpolls":
+            if not is_owner(user_id):
+                return
+            api.answer_callback_query(cq["id"])
+            admin_show_all_polls_boost(chat_id)
+            return
+        elif data == "menu:main":
+            reset_state(user_id)
+            api.answer_callback_query(cq["id"])
+            send_main_menu(chat_id, user_id)
+            return
+
+        elif data.startswith("poll_edit_select:"):
+            poll_id = int(data.split(":")[1])
+            poll = get_poll(poll_id)
+            if not poll or poll["status"] != "open":
+                api.answer_callback_query(cq["id"], "❌ This poll is not active.", show_alert=True)
+                return
+            
+            if poll["creator_id"] != user_id:
+                api.answer_callback_query(cq["id"], "⛔ You are not the creator of this poll! Only the creator can edit it.", show_alert=True)
+                return
+
+            set_step(user_id, "await_add_options", {"poll_id": poll_id})
+            api.answer_callback_query(cq["id"])
+            api.send_message(
+                chat_id,
+                "✏️ <b>Add new participants to the active poll</b>\n\n"
+                "Send the names of the participants you want to add (separated by commas).",
+                reply_markup=cancel_keyboard(),
+            )
+        elif data.startswith("vote:"):
+            _, poll_id, opt_idx = data.split(":")
+            do_vote(cq, int(poll_id), int(opt_idx))
+        elif data.startswith("retract:"):
+            poll_id = int(data.split(":")[1])
+            do_retract(cq, poll_id)
+        elif data.startswith("close:"):
+            poll_id = int(data.split(":")[1])
+            do_close(cq, poll_id)
+        elif data.startswith("admin_poll:"):
+            poll_id = int(data.split(":")[1])
+            api.answer_callback_query(cq["id"])
+            admin_show_poll_options(chat_id, poll_id)
+        elif data.startswith("admin_opt_menu:"):
+            _, poll_id, opt_idx = data.split(":")
+            api.answer_callback_query(cq["id"])
+            admin_show_option_action_menu(chat_id, int(poll_id), int(opt_idx))
+        elif data.startswith("admin_boost:"):
+            _, poll_id, opt_idx = data.split(":")
+            set_step(user_id, "admin_boost_step", {"poll_id": int(poll_id), "opt_idx": int(opt_idx)})
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, "➕ How many votes do you want to add? (e.g. 50):", reply_markup=cancel_keyboard())
+        elif data.startswith("admin_reduce:"):
+            _, poll_id, opt_idx = data.split(":")
+            poll = get_poll(int(poll_id))
+            counts = vote_counts(int(poll_id), len(json.loads(poll["options"])))
+            curr_c = counts[int(opt_idx)]
+            if curr_c <= 0:
+                api.answer_callback_query(cq["id"], "⚠️ There are no votes to reduce for this option.", show_alert=True)
+                return
+            set_step(user_id, "admin_reduce_step", {
+                "poll_id": int(poll_id),
+                "opt_idx": int(opt_idx),
+                "current_votes": curr_c
+            })
+            api.answer_callback_query(cq["id"])
+            api.send_message(chat_id, f"👉 How many votes do you want to reduce? (Enter a number between 1 and {curr_c}):", reply_markup=cancel_keyboard())
+        else:
+            api.answer_callback_query(cq["id"])
+    except Exception:
+        traceback.print_exc()
+        try:
+            api.answer_callback_query(cq["id"], "⚠️ Something went wrong, please try again.", show_alert=True)
+        except Exception:
+            pass
+
+# ======================================================================
+# MAIN LOOP
+# ======================================================================
+
+def run():
+    global BOT_ID, BOT_USERNAME
+    init_db()
+    me = api.get_me()
+    BOT_ID = me["id"]
+    BOT_USERNAME = me.get("username")
+    print(f"✅ Logged in as @{BOT_USERNAME} (id={BOT_ID})")
+
+    # Start auto-timer thread in the background
+    threading.Thread(target=auto_poll_closer_loop, daemon=True).start()
+
+    offset = None
+    while True:
+        try:
+            updates = api.get_updates(offset=offset, timeout=POLL_TIMEOUT)
+        except Exception as e:
+            print("getUpdates error:", e)
+            time.sleep(3)
+            continue
+
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            try:
+                if "message" in upd:
+                    handle_message(upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
+                elif "chat_member" in upd:
+                    handle_chat_member(upd["chat_member"])
+            except Exception:
+                traceback.print_exc()
+
+
+if __name__ == "__main__":
+    run()
