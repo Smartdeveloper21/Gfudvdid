@@ -17,15 +17,15 @@ import requests
 # CONFIG
 # ======================================================================
 
-BOT_TOKEN = "8967754172:AAEw49Dv9i9Uo4L6CK-g1hr6Wa5pwBt2dY0"      # from @BotFather
+BOT_TOKEN = "8944212122:AAGZzFuVsYg2k2XtnZuGUFEtqbmdbeI2g8s"      # from @BotFather
 
 OWNER_IDS = [
-    8237042199,  # <-- your numeric Telegram user ID
+    8573155257,  # <-- your numeric Telegram user ID
 ]
 
 # Credit & promo settings
-CREDIT_BOT_USERNAME = "PollzyBot"
-PROMO_BOT_URL = "https://t.me/PollzyBot"
+CREDIT_BOT_USERNAME = "Bot"
+PROMO_BOT_URL = "https://t.me/"
 PROMO_BUTTON_TEXT = "🗳 Create a Free Poll"
 
 DB_PATH = "pollbot.db"
